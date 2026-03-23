@@ -473,22 +473,6 @@ enum mac_soft_ring_set_type {
 	 */
 	SRST_LATENCY_OPT		= 1 << 3,
 	/*
-	 * This Rx SRS has softrings assigned, and has at least one per traffic
-	 * class. Traffic must move to a softring for processing, but may still
-	 * drain inline if the SRS is quiet.
-	 *
-	 * Immutable. Requires !`SRST_TX`. Mutually exclusive with
-	 * `SRST_NO_SOFT_RINGS`.
-	 */
-	SRST_FANOUT_PROTO		= 1 << 4,
-	/*
-	 * This receive SRS has more than one softring for each traffic class,
-	 * and must hash/round-robin received packets amongst a class's rings.
-	 *
-	 * Mutable. Requires !`SRST_TX`.
-	 */
-	SRST_FANOUT_SRC_IP		= 1 << 5,
-	/*
 	 * All softrings will be initialised with `ST_RING_WORKER_ONLY`.
 	 *
 	 * Set when `SRST_LATENCY_OPT` is disabled, or when the underlying ring
@@ -772,51 +756,45 @@ typedef void (*mac_srs_drain_proc_t)(mac_soft_ring_set_t *,
     const mac_soft_ring_set_state_t);
 
 /*
- * mac_soft_ring_set_s:
- * This is used both for Tx and Rx side. The srs_type identifies Rx or
- * Tx type.
+ * The first-line packet queue hit once packets are received from or
+ * transmitted onto a MAC provider. srs_type identifies whether an SRS
+ * is transmit or receive, as well as other aspects of how packets should be
+ * processed.
  *
- * Note that the structure is carefully crafted, with Rx elements coming
- * first followed by Tx specific members. Future additions to this
- * structure should follow the same guidelines.
+ * # Rx SRS operation
+ * Softrings in an Rx SRS are responsible for parallelising the upstack
+ * processing of inbound traffic, by fanning out from a single Rx ring or device
+ * entrypoint.
  *
- * Rx-side notes:
- * mac_rx_classify_flow_add() always creates a mac_soft_ring_set_t and fn_flow
- * points to info from it (func = srs_lower_proc, arg = soft_ring_set). On
- * interrupt path, srs_lower_proc does B/W adjustment and switch to polling mode
- * (if poll capable) and feeds the packets to soft_ring_list via choosen
- * fanout type (specified by srs_type). In poll mode, the poll thread which is
- * also a pointer can pick up the packets and feed them to various
- * soft_ring_list.
+ * In the interrupt path, `sr_lower_proc` is responsible for moving packets into
+ * the SRS. Bandwidth adjustment controls whether packets can be enqueued here
+ * and the rate at which they are dequeued. Once dequeued, the packets are
+ * fanned out across `srs_soft_rings` according to `srs_type`, and may switch to
+ * polling mode (if poll capable). In poll mode, the poll thread is often
+ * expected to perform fanout if the SRS is `SRST_LATENCY_OPT`.
  *
- * The srs_type can either be protocol based or fanout based where fanout itelf
- * can be various types
+ * Polling works by turning off interrupts if packets are still queued on any
+ * soft ring reachable via an SRS once the drain routine finishes. Once
+ * the backlog is clear and a poll attempt returns no packets, i.e., the Rx ring
+ * doesn't have anything, interrupts are turned back on. For this purpose we
+ * keep a separate `sr_poll_pkt_cnt` counter which tracks the sum of packets
+ * present in all these queues. The counter is incremented when packets
+ * are queued in the SRS and decremented once they are fully processed by a
+ * client (via sr_func or the soft rings). It's important that this decrement
+ * occurs after handoff to the client, since this best reflects the rate at
+ * which MAC clients are willing/able to process this traffic.
  *
- * The polling works by turning off interrupts as soon as a packets
- * are queued on the soft ring set. Once the backlog is clear and poll
- * thread return empty handed i.e. Rx ring doesn't have anything, the
- * interrupt is turned back on. For this purpose we keep a separate
- * srs_poll_pkt_cnt counter which tracks the packets queued between SRS
- * and the soft rings as well. The counter is incremented when packets
- * are queued and decremented when SRS processes them (in case it has
- * no soft rings) or the soft ring process them. Its important that
- * in case SRS has softrings, the decrement doesn't happen till the
- * packet is processed by the soft rings since it takes very little time
- * for SRS to queue packet from SRS to soft rings and it will keep
- * bringing more packets in the system faster than soft rings can
- * process them.
+ * # Tx SRS operation
+ * Softrings in a Tx SRS each hold a Tx ring returned from the underlying
+ * device. The SRS is responsible for handling traffic from many upstack
+ * callers, and fanning it out across these rings using either an optional hint
+ * value or computing packets' flow hash. Devices without HW ring capabilities
+ * will have no softrings and go straight to the device.
  *
- * Tx side notes:
- * The srs structure acts as a serializer with a worker thread. The
- * default behavior of srs though is to act as a pass-thru. The queues
- * (srs_first, srs_last, srs_count) get used when Tx ring runs out of Tx
- * descriptors or to enforce bandwidth limits.
- *
- * When multiple Tx rings are present, the SRS state will be set to
- * SRS_FANOUT_OTH. Outgoing packets coming into mac_tx_srs_process()
- * function will be fanned out to one of the Tx side soft rings based on
- * a hint passed in mac_tx_srs_process(). Each soft ring, in turn, will
- * be associated with a distinct h/w Tx ring.
+ * The SRS structure acts as a serializer with a worker thread. The Tx SRS's
+ * default behaviour is to act as a pass-through and either send straight to the
+ * NIC or to a target softring. The queue in each layer is used when either a
+ * Tx ring runs out of descriptors, or to enforce bandwidth limits.
  */
 struct mac_soft_ring_set_s {
 	/*

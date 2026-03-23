@@ -1917,10 +1917,6 @@ mac_srs_fanout_modify(mac_client_impl_t *mcip, mac_direct_rx_t rx_func,
 
 	if (new_fanout_cnt > srings_present) {
 		/* soft rings increased */
-		mutex_enter(&mac_rx_srs->srs_lock);
-		mac_rx_srs->srs_type |= SRST_FANOUT_SRC_IP;
-		mutex_exit(&mac_rx_srs->srs_lock);
-
 		for (i = mac_rx_srs->srs_tcp_ring_count;
 		    i < new_fanout_cnt; i++) {
 			/*
@@ -1933,13 +1929,6 @@ mac_srs_fanout_modify(mac_client_impl_t *mcip, mac_direct_rx_t rx_func,
 		mac_srs_update_fanout_list(mac_rx_srs);
 	} else if (new_fanout_cnt < srings_present) {
 		/* soft rings decreased */
-		if (new_fanout_cnt == 1) {
-			mutex_enter(&mac_rx_srs->srs_lock);
-			mac_rx_srs->srs_type &= ~SRST_FANOUT_SRC_IP;
-			ASSERT(mac_rx_srs->srs_type & SRST_FANOUT_PROTO);
-			mutex_exit(&mac_rx_srs->srs_lock);
-		}
-		/* Get rid of extra soft rings */
 		for (i = new_fanout_cnt;
 		    i < mac_rx_srs->srs_tcp_ring_count; i++) {
 			softring = mac_rx_srs->srs_tcp_soft_rings[i];
@@ -2078,15 +2067,13 @@ mac_srs_fanout_init(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
 	}
 
 alldone:
-	if (soft_ring_cnt > 1)
-		mac_rx_srs->srs_type |= SRST_FANOUT_SRC_IP;
 	mac_srs_update_fanout_list(mac_rx_srs);
 	mac_srs_client_poll_enable(mcip, mac_rx_srs, B_FALSE);
 	mac_srs_client_poll_enable(mcip, mac_rx_srs, B_TRUE);
 	return;
 
 no_softrings:
-	if (mac_rx_srs->srs_type & SRST_FANOUT_PROTO) {
+	if ((mac_rx_srs->srs_type & SRST_LINK) != 0) {
 		mutex_enter(&cpu_lock);
 		cpuid = mac_next_bind_cpu(cpupart);
 		/* Create the protocol softrings */
@@ -2385,43 +2372,6 @@ done:
 }
 
 /*
- * Figure out the number of soft rings required. Its dependant on
- * if protocol fanout is required (for LINKs), global settings
- * require us to do fanout for performance (based on mac_soft_ring_enable),
- * or user has specifically requested fanout.
- */
-static mac_soft_ring_set_type_t
-mac_find_fanout(flow_entry_t *flent, const mac_soft_ring_set_type_t link_type)
-{
-	uint32_t			fanout_type;
-	mac_resource_props_t		*mrp = &flent->fe_effective_props;
-
-	/* no fanout for subflows */
-	switch (link_type) {
-	case SRST_FLOW:
-		fanout_type = SRST_NO_SOFT_RINGS;
-		break;
-	case SRST_LINK:
-		fanout_type = SRST_FANOUT_PROTO;
-		break;
-	}
-
-	/* A primary NIC/link is being plumbed */
-	if (flent->fe_type & FLOW_PRIMARY_MAC) {
-		if (mac_soft_ring_enable && mac_rx_soft_ring_count > 1) {
-			fanout_type |= SRST_FANOUT_SRC_IP;
-		}
-	} else if (flent->fe_type & FLOW_VNIC) {
-		/* A VNIC is being created */
-		if (mrp != NULL && mrp->mrp_ncpus > 0) {
-			fanout_type |= SRST_FANOUT_SRC_IP;
-		}
-	}
-
-	return (fanout_type);
-}
-
-/*
  * Change a group from h/w to s/w classification.
  */
 void
@@ -2522,15 +2472,13 @@ mac_rx_srs_group_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 	 */
 	ASSERT3U((mcip->mci_state_flags & MCIS_IS_AGGR_PORT), ==, 0);
 
-	const mac_soft_ring_set_type_t fanout_type =
-	    mac_find_fanout(flent, link_type);
 	no_unicast = (mcip->mci_state_flags & MCIS_NO_UNICAST_ADDR) != 0;
 
 	/* Create the SRS for SW classification if none exists */
 	if (flent->fe_rx_srs[0] == NULL) {
 		ASSERT(flent->fe_rx_srs_cnt == 0);
-		mac_srs = mac_srs_create(mcip, flent, fanout_type | link_type,
-		    mac_rx_deliver, NULL);
+		mac_srs = mac_srs_create(mcip, flent, link_type, mac_rx_deliver,
+		    NULL);
 		mutex_enter(&flent->fe_lock);
 		flent->fe_cb_fn = (flow_fn_t)mac_srs->srs_rx.sr_lower_proc;
 		flent->fe_cb_arg1 = (void *)mip;
@@ -2577,8 +2525,7 @@ mac_rx_srs_group_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 				 * make use of dynamic polling of said
 				 * HW rings.
 				 */
-				mac_srs = mac_srs_create(mcip, flent,
-				    fanout_type | link_type,
+				mac_srs = mac_srs_create(mcip, flent, link_type,
 				    mac_rx_deliver, ring);
 				break;
 			default:
