@@ -1623,450 +1623,37 @@ typedef enum pkt_type {
 /*
  * Pair of local and remote ports in the transport header
  */
-#define	PORTS_SIZE 4
-
-/*
- * This routine delivers packets destined for an SRS into one of the
- * protocol soft rings.
- *
- * Given a chain of packets we need to split it up into multiple sub
- * chains: TCP, UDP or OTH soft ring. Instead of entering the soft
- * ring one packet at a time, we want to enter it in the form of a
- * chain otherwise we get this start/stop behaviour where the worker
- * thread goes to sleep and then next packet comes in forcing it to
- * wake up.
- */
-static void
-mac_rx_srs_proto_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
-{
-	mblk_t			*headmp[ST_RING_NUM_PROTO] = { 0 };
-	mblk_t			*tailmp[ST_RING_NUM_PROTO] = { 0 };
-	int			cnt[ST_RING_NUM_PROTO] = { 0 };
-	size_t			sz[ST_RING_NUM_PROTO] = { 0 };
-	mac_client_impl_t	*mcip = mac_srs->srs_mcip;
-
-	const boolean_t is_ether =
-	    (mcip->mci_mip->mi_info.mi_nativemedia == DL_ETHER);
-
-	/*
-	 * If we don't have a Rx ring, S/W classification would have done
-	 * its job and its a packet meant for us. If we were polling on
-	 * the default ring (i.e. there was a ring assigned to this SRS),
-	 * then we need to make sure that the mac address really belongs
-	 * to us.
-	 */
-	const boolean_t hw_classified = mac_srs->srs_ring != NULL &&
-	    mac_srs->srs_ring->mr_classify_type == MAC_HW_CLASSIFIER;
-
-	/*
-	 * Some clients, such as non-ethernet, need DLS processing in the Rx
-	 * path. Such clients clear the bypass flag. DLS bypass may also be
-	 * disabled via the MCIS_RX_BYPASS_DISABLE flag.
-	 */
-	const boolean_t dls_bypass_v4 =
-	    ((mac_srs->srs_type & SRST_DLS_BYPASS_V4) != 0) &&
-	    ((mcip->mci_state_flags & MCIS_RX_BYPASS_DISABLE) == 0);
-
-	const boolean_t dls_bypass_v6 =
-	    ((mac_srs->srs_type & SRST_DLS_BYPASS_V6) != 0) &&
-	    ((mcip->mci_state_flags & MCIS_RX_BYPASS_DISABLE) == 0);
-
-	/*
-	 * We have a chain from SRS that we need to split across the
-	 * soft rings. The squeues for the TCP and IPv4 SAPs use their
-	 * own soft rings to allow polling from the squeue. The rest of
-	 * the packets are delivered on the OTH soft ring which cannot
-	 * be polled.
-	 */
-	while (head != NULL) {
-		mac_ether_offload_info_t meoi = { 0 };
-		uint8_t ether_addr[ETHERADDRL];
-		const uint8_t *dstaddr = ether_addr;
-		mac_header_info_t non_ether_mhi;
-		boolean_t is_unicast = B_FALSE;
-
-		mblk_t *mp = head;
-		head = head->b_next;
-		mp->b_next = NULL;
-		const size_t sz1 =
-		    (mp->b_cont == NULL) ? MBLKL(mp) : msgdsize(mp);
-
-		if (is_ether) {
-			uint32_t vlan_tci;
-
-			mac_ether_offload_info(mp, &meoi);
-			if ((meoi.meoi_flags & MEOI_L2INFO_SET) == 0 ||
-			    !mac_ether_l2_info(mp, ether_addr, &vlan_tci)) {
-				mac_rx_drop_pkt(mac_srs, mp);
-				continue;
-			}
-
-			/*
-			 * Check if the VID of the packet, if any, belongs to
-			 * this client.  Technically, if this packet came up via
-			 * a HW classified ring then we don't need to perform
-			 * this check.  Perhaps a future optimization.
-			 */
-			if ((meoi.meoi_flags & MEOI_VLAN_TAGGED) != 0) {
-				ASSERT3U(meoi.meoi_l2hlen, ==,
-				    sizeof (struct ether_vlan_header));
-				ASSERT3U(vlan_tci, <=, UINT16_MAX);
-
-				if (!mac_client_check_flow_vid(mcip,
-				    VLAN_ID(vlan_tci))) {
-					mac_rx_drop_pkt(mac_srs, mp);
-					continue;
-				}
-			}
-
-			is_unicast = ((ether_addr[0] & 0x01) == 0);
-		} else {
-			if (mac_header_info((mac_handle_t)mcip->mci_mip,
-			    mp, &non_ether_mhi) != 0) {
-				mac_rx_drop_pkt(mac_srs, mp);
-				continue;
-			}
-
-			meoi.meoi_l2hlen = non_ether_mhi.mhi_hdrsize;
-			meoi.meoi_l3proto = non_ether_mhi.mhi_bindsap;
-			meoi.meoi_flags = MEOI_L2INFO_SET;
-			(void) mac_partial_offload_info(mp, 0, &meoi);
-
-			is_unicast =
-			    (non_ether_mhi.mhi_dsttype == MAC_ADDRTYPE_UNICAST);
-			dstaddr = non_ether_mhi.mhi_daddr;
-		}
-
-		if ((!dls_bypass_v4 && meoi.meoi_l3proto == ETHERTYPE_IP) ||
-		    (!dls_bypass_v6 && meoi.meoi_l3proto == ETHERTYPE_IPV6)) {
-			DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
-			    mac_ether_offload_info_t *, &meoi,
-			    mac_soft_ring_set_t *, mac_srs, pkt_type_t, OTH);
-			FANOUT_ENQUEUE_MP(headmp[OTH], tailmp[OTH], cnt[OTH],
-			    sz[OTH], sz1, mp);
-			continue;
-		}
-
-		ASSERT((meoi.meoi_flags & MEOI_L2INFO_SET) != 0);
-
-		boolean_t is_fastpath = B_FALSE;
-
-		if (meoi.meoi_l3proto == ETHERTYPE_IP ||
-		    meoi.meoi_l3proto == ETHERTYPE_IPV6) {
-			/*
-			 * If we are H/W classified, but we have promisc
-			 * on, then we need to check for the unicast address.
-			 */
-			if (hw_classified && mcip->mci_promisc_list != NULL) {
-				mac_address_t		*map;
-
-				rw_enter(&mcip->mci_rw_lock, RW_READER);
-				map = mcip->mci_unicast;
-				if (bcmp(dstaddr, map->ma_addr,
-				    map->ma_len) == 0)
-					is_fastpath = B_TRUE;
-				rw_exit(&mcip->mci_rw_lock);
-			} else if (is_unicast) {
-				is_fastpath = B_TRUE;
-			}
-		}
-
-		/*
-		 * This needs to become a contract with the driver for
-		 * the fast path.
-		 *
-		 * In the normal case the packet will have at least the L2
-		 * header and the IP + Transport header in the same mblk.
-		 * This is usually the case when the NIC driver sends up
-		 * the packet. This is also true when the stack generates
-		 * a packet that is looped back and when the stack uses the
-		 * fastpath mechanism. The normal case is optimized for
-		 * performance and may bypass DLS. All other cases go through
-		 * the 'OTH' type path without DLS bypass.
-		 */
-		if (is_fastpath) {
-			if ((meoi.meoi_flags & MEOI_L3INFO_SET) == 0 ||
-			    (meoi.meoi_flags & MEOI_L4INFO_SET) == 0) {
-				is_fastpath = B_FALSE;
-			}
-			if (DB_TYPE(mp) != M_DATA || DB_REF(mp) != 1) {
-				is_fastpath = B_FALSE;
-			}
-
-			const size_t total_hdr_len = meoi.meoi_l2hlen
-			    + meoi.meoi_l3hlen + meoi.meoi_l4hlen;
-
-			if (!OK_32PTR(mp->b_rptr + meoi.meoi_l2hlen) ||
-			    total_hdr_len > MBLKL(mp)) {
-				is_fastpath = B_FALSE;
-			}
-		}
-
-		if (!is_fastpath) {
-			DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
-			    mac_ether_offload_info_t *, &meoi,
-			    mac_soft_ring_set_t *, mac_srs, pkt_type_t, OTH);
-			FANOUT_ENQUEUE_MP(headmp[OTH], tailmp[OTH], cnt[OTH],
-			    sz[OTH], sz1, mp);
-			continue;
-		}
-
-		/*
-		 * Determine the type from the IP protocol value. If classified
-		 * as TCP or UDP, then update the read pointer to the beginning
-		 * of the IP header.  Otherwise leave the message as is for
-		 * further processing by DLS.
-		 */
-		pkt_type_t type = OTH;
-		switch (meoi.meoi_l4proto) {
-		case IPPROTO_TCP:
-			type = (meoi.meoi_l3proto == ETHERTYPE_IPV6) ?
-			    V6_TCP : V4_TCP;
-			mp->b_rptr += meoi.meoi_l2hlen;
-			break;
-		case IPPROTO_UDP:
-			type = (meoi.meoi_l3proto == ETHERTYPE_IPV6) ?
-			    V6_UDP : V4_UDP;
-			mp->b_rptr += meoi.meoi_l2hlen;
-			break;
-		default:
-			break;
-		}
-
-		DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
-		    mac_ether_offload_info_t *, &meoi, mac_soft_ring_set_t *,
-		    mac_srs, pkt_type_t, type);
-		FANOUT_ENQUEUE_MP(headmp[type], tailmp[type], cnt[type],
-		    sz[type], sz1, mp);
-	}
-
-	for (pkt_type_t type = V4_TCP; type < UNDEF; type++) {
-		if (headmp[type] != NULL) {
-			mac_soft_ring_t			*softring;
-
-			ASSERT(tailmp[type]->b_next == NULL);
-			switch (type) {
-			case V4_TCP:
-				softring = mac_srs->srs_tcp_soft_rings[0];
-				break;
-			case V6_TCP:
-				softring = mac_srs->srs_tcp6_soft_rings[0];
-				break;
-			case V4_UDP:
-				softring = mac_srs->srs_udp_soft_rings[0];
-				break;
-			case V6_UDP:
-				softring = mac_srs->srs_udp6_soft_rings[0];
-				break;
-			case OTH:
-				softring = mac_srs->srs_oth_soft_rings[0];
-			}
-			mac_rx_soft_ring_process(mcip, softring,
-			    headmp[type], tailmp[type], cnt[type], sz[type]);
-		}
-	}
-}
+#define	PORTS_SIZE (sizeof (uint16_t) * 2)
 
 int	fanout_unaligned = 0;
-
-/*
- * The fanout routine for any clients with DLS bypass disabled or for
- * traffic classified as "other". Returns -1 on an error (drop the
- * packet due to a malformed packet), 0 on success, with values
- * written in *indx and *type.
- */
-static int
-mac_rx_srs_long_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *mp,
-    uint32_t sap, size_t hdrsize, pkt_type_t *type, uint_t *indx)
-{
-	ip6_t		*ip6h;
-	ipha_t		*ipha;
-	uint8_t		*whereptr;
-	uint_t		hash;
-	uint16_t	remlen;
-	uint8_t		nexthdr;
-	uint16_t	hdr_len;
-	uint32_t	src_val, dst_val;
-	boolean_t	modifiable = B_TRUE;
-	boolean_t	v6;
-
-	ASSERT(MBLKL(mp) >= hdrsize);
-
-	if (sap == ETHERTYPE_IPV6) {
-		v6 = B_TRUE;
-		hdr_len = IPV6_HDR_LEN;
-	} else if (sap == ETHERTYPE_IP) {
-		v6 = B_FALSE;
-		hdr_len = IP_SIMPLE_HDR_LENGTH;
-	} else {
-		*indx = 0;
-		*type = OTH;
-		return (0);
-	}
-
-	ip6h = (ip6_t *)(mp->b_rptr + hdrsize);
-	ipha = (ipha_t *)ip6h;
-
-	if ((uint8_t *)ip6h == mp->b_wptr) {
-		/*
-		 * The first mblk_t only includes the mac header.
-		 * Note that it is safe to change the mp pointer here,
-		 * as the subsequent operation does not assume mp
-		 * points to the start of the mac header.
-		 */
-		mp = mp->b_cont;
-
-		/*
-		 * Make sure the IP header points to an entire one.
-		 */
-		if (mp == NULL)
-			return (-1);
-
-		if (MBLKL(mp) < hdr_len) {
-			modifiable = (DB_REF(mp) == 1);
-
-			if (modifiable && !pullupmsg(mp, hdr_len))
-				return (-1);
-		}
-
-		ip6h = (ip6_t *)mp->b_rptr;
-		ipha = (ipha_t *)ip6h;
-	}
-
-	if (!modifiable || !(OK_32PTR((char *)ip6h)) ||
-	    ((uint8_t *)ip6h + hdr_len > mp->b_wptr)) {
-		/*
-		 * If either the IP header is not aligned, or it does not hold
-		 * the complete simple structure (a pullupmsg() is not an
-		 * option since it would result in an unaligned IP header),
-		 * fanout to the default ring.
-		 *
-		 * Note that this may cause packet reordering.
-		 */
-		*indx = 0;
-		*type = OTH;
-		fanout_unaligned++;
-		return (0);
-	}
-
-	/*
-	 * Extract next-header, full header length, and source-hash value
-	 * using v4/v6 specific fields.
-	 */
-	if (v6) {
-		remlen = ntohs(ip6h->ip6_plen);
-		nexthdr = ip6h->ip6_nxt;
-		src_val = V4_PART_OF_V6(ip6h->ip6_src);
-		dst_val = V4_PART_OF_V6(ip6h->ip6_dst);
-		/*
-		 * Do src based fanout if below tunable is set to B_TRUE or
-		 * when mac_ip_hdr_length_v6() fails because of malformed
-		 * packets or because mblks need to be concatenated using
-		 * pullupmsg().
-		 *
-		 * Perform a version check to prevent parsing weirdness...
-		 */
-		if (IPH_HDR_VERSION(ip6h) != IPV6_VERSION ||
-		    !mac_ip_hdr_length_v6(ip6h, mp->b_wptr, &hdr_len, &nexthdr,
-		    NULL)) {
-			goto src_dst_based_fanout;
-		}
-	} else {
-		hdr_len = IPH_HDR_LENGTH(ipha);
-		remlen = ntohs(ipha->ipha_length) - hdr_len;
-		nexthdr = ipha->ipha_protocol;
-		src_val = (uint32_t)ipha->ipha_src;
-		dst_val = (uint32_t)ipha->ipha_dst;
-		/*
-		 * Catch IPv4 fragment case here.  IPv6 has nexthdr == FRAG
-		 * for its equivalent case.
-		 */
-		if ((ntohs(ipha->ipha_fragment_offset_and_flags) &
-		    (IPH_MF | IPH_OFFSET)) != 0) {
-			goto src_dst_based_fanout;
-		}
-	}
-	if (remlen < MIN_EHDR_LEN)
-		return (-1);
-	whereptr = (uint8_t *)ip6h + hdr_len;
-
-	/* If the transport is one of below, we do port/SPI based fanout */
-	switch (nexthdr) {
-	case IPPROTO_TCP:
-	case IPPROTO_UDP:
-	case IPPROTO_SCTP:
-	case IPPROTO_ESP:
-		/*
-		 * If the ports or SPI in the transport header is not part of
-		 * the mblk, do src_based_fanout, instead of calling
-		 * pullupmsg().
-		 */
-		if (mp->b_cont == NULL || whereptr + PORTS_SIZE <= mp->b_wptr)
-			break;	/* out of switch... */
-		/* FALLTHRU */
-	default:
-		goto src_dst_based_fanout;
-	}
-
-	switch (nexthdr) {
-	case IPPROTO_TCP:
-		hash = HASH_ADDR(src_val, dst_val, *(uint32_t *)whereptr);
-		*indx = COMPUTE_INDEX(hash, mac_srs->srs_tcp_ring_count);
-		*type = OTH;
-		break;
-	case IPPROTO_UDP:
-	case IPPROTO_SCTP:
-	case IPPROTO_ESP:
-		if (mac_fanout_type == MAC_FANOUT_DEFAULT) {
-			hash = HASH_ADDR(src_val, dst_val,
-			    *(uint32_t *)whereptr);
-			*indx = COMPUTE_INDEX(hash,
-			    mac_srs->srs_udp_ring_count);
-		} else {
-			*indx = mac_srs->srs_ind % mac_srs->srs_udp_ring_count;
-			mac_srs->srs_ind++;
-		}
-		*type = OTH;
-		break;
-	}
-	return (0);
-
-src_dst_based_fanout:
-	hash = HASH_ADDR(src_val, dst_val, (uint32_t)0);
-	*indx = COMPUTE_INDEX(hash, mac_srs->srs_oth_ring_count);
-	*type = OTH;
-	return (0);
-}
 
 /*
  * This routine delivers packets destined for an SRS into a soft ring member
  * of the set.
  *
- * Given a chain of packets we need to split it up into multiple sub
- * chains: TCP, UDP or OTH soft ring. Instead of entering the soft
+ * Given a chain of packets we need to split it up into multiple sub chains
+ * across the set of softrings we have. Instead of entering the soft
  * ring one packet at a time, we want to enter it in the form of a
  * chain otherwise we get this start/stop behaviour where the worker
  * thread goes to sleep and then next packet comes in forcing it to
  * wake up.
  *
  * Note:
- * Since we know what is the maximum fanout possible, we create a 2D array
- * of 'softring types * MAX_SR_FANOUT' for the head, tail, cnt and sz
- * variables so that we can enter the softrings with chain. We need the
- * MAX_SR_FANOUT so we can allocate the arrays on the stack (a kmem_alloc
- * for each packet would be expensive). If we ever want to have the
- * ability to have unlimited fanout, we should probably declare a head,
- * tail, cnt, sz with each soft ring (a data struct which contains a softring
- * along with these members) and create an array of this uber struct so we
- * don't have to do kmem_alloc.
+ * Since we know what is the maximum fanout possible, we create an array
+ * of 'MAX_SR_FANOUT' for the head, tail, cnt and sz variables so that we
+ * can enter the softrings with a chain. We need the MAX_SR_FANOUT so we can
+ * allocate the arrays on the stack (a kmem_alloc for each packet would be
+ * expensive). If we ever want to have the ability to have unlimited fanout, we
+ * should probably declare a head, tail, cnt, sz with each soft ring (a data
+ * struct which contains a softring along with these members) and create an
+ * array of this uber struct so we don't have to do kmem_alloc.
  */
-
 static void
 mac_rx_srs_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
 {
 	mblk_t			*headmp[ST_RING_NUM_PROTO][MAX_SR_FANOUT];
 	mblk_t			*tailmp[ST_RING_NUM_PROTO][MAX_SR_FANOUT];
-	int			cnt[ST_RING_NUM_PROTO][MAX_SR_FANOUT];
+	uint32_t		cnt[ST_RING_NUM_PROTO][MAX_SR_FANOUT];
 	size_t			sz[ST_RING_NUM_PROTO][MAX_SR_FANOUT];
 	mac_client_impl_t	*mcip = mac_srs->srs_mcip;
 
@@ -2074,13 +1661,15 @@ mac_rx_srs_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
 	    (mcip->mci_mip->mi_info.mi_nativemedia == DL_ETHER);
 
 	/*
-	 * If we don't have a Rx ring, S/W classification would have done
+	 * If we don't have an Rx ring, S/W classification would have done
 	 * its job and its a packet meant for us. If we were polling on
 	 * the default ring (i.e. there was a ring assigned to this SRS),
-	 * then we need to make sure that the mac address really belongs
-	 * to us.
+	 * then we need to make sure that any unicast L2 traffic really belongs
+	 * to us when promiscuous mode is enabled.
 	 */
-	const boolean_t hw_classified = mac_srs->srs_ring != NULL &&
+	const boolean_t verify_hw_classified = mac_srs->srs_ring != NULL &&
+	    (mac_srs->srs_type & SRST_DEFAULT_GRP) != 0 &&
+	    mcip->mci_promisc_list != NULL &&
 	    mac_srs->srs_ring->mr_classify_type == MAC_HW_CLASSIFIER;
 
 	/*
@@ -2098,34 +1687,47 @@ mac_rx_srs_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
 	    ((mcip->mci_state_flags & MCIS_RX_BYPASS_DISABLE) == 0);
 
 	/*
-	 * Since the softrings are never destroyed and we always
-	 * create equal number of softrings for TCP, UDP and rest,
-	 * its OK to check one of them for count and use it without
-	 * any lock. In future, if soft rings get destroyed because
-	 * of reduction in fanout, we will need to ensure that happens
-	 * behind the SRS_PROC.
+	 * Softrings can be created/destroyed, but only under Rx quiescence.
+	 * Being here *requires* that `SRS_PROC` is set, which prohibits the
+	 * worker thread from upgrading `SRS_QUIESCE` to `SRS_QUIESCE_DONE`, and
+	 * thus the quiesce cannot yet proceed. Because of this it is fine to
+	 * access the soft ring count and rings themselves without `srs_lock`.
 	 */
 	const int fanout_cnt = mac_srs->srs_tcp_ring_count;
+	ASSERT3S(mac_srs->srs_udp_ring_count, ==, fanout_cnt);
+	ASSERT3S(mac_srs->srs_tcp6_ring_count, ==, fanout_cnt);
+	ASSERT3S(mac_srs->srs_udp6_ring_count, ==, fanout_cnt);
+	ASSERT3S(mac_srs->srs_oth_ring_count, ==, fanout_cnt);
 
-	bzero(headmp, sizeof (headmp));
-	bzero(tailmp, sizeof (tailmp));
-	bzero(cnt, sizeof (cnt));
-	bzero(sz, sizeof (sz));
+	if (fanout_cnt == 0) {
+		headmp[OTH][0] = NULL;
+		tailmp[OTH][0] = NULL;
+		cnt[OTH][0] = 0;
+		sz[OTH][0] = 0;
+	} else {
+		bzero(headmp, sizeof (headmp));
+		bzero(tailmp, sizeof (tailmp));
+		bzero(cnt, sizeof (cnt));
+		bzero(sz, sizeof (sz));
+	}
 
 	/*
 	 * We got a chain from SRS that we need to send to the soft rings.
-	 * Since squeues for TCP & IPv4 SAP poll their soft rings (for
-	 * performance reasons), we need to separate out v4_tcp, v4_udp
-	 * and the rest goes in other.
+	 * Use protocol information to derive the flow hash of each for this
+	 * purpose. IPv4/TCP SAPs (or other client flow bindings) may poll these
+	 * softrings, and are reliant on the hash matching any SQueue bindings.
 	 */
 	while (head != NULL) {
 		mac_ether_offload_info_t meoi = { 0 };
 		uint8_t ether_addr[ETHERADDRL];
 		const uint8_t *dstaddr = ether_addr;
 		mac_header_info_t non_ether_mhi;
-		pkt_type_t type;
-		uint_t indx;
+		pkt_type_t type = OTH;
+		uint_t indx = 0;
+		uint_t hash = 0;
+		uint32_t ports = 0;
 		boolean_t is_unicast = B_FALSE;
+		boolean_t is_fastpath = B_FALSE;
 
 		mblk_t *mp = head;
 		head = head->b_next;
@@ -2183,22 +1785,22 @@ mac_rx_srs_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
 			dstaddr = non_ether_mhi.mhi_daddr;
 		}
 
-		if ((!dls_bypass_v4 && meoi.meoi_l3proto == ETHERTYPE_IP) ||
-		    (!dls_bypass_v6 && meoi.meoi_l3proto == ETHERTYPE_IPV6)) {
-			if (mac_rx_srs_long_fanout(mac_srs, mp,
-			    meoi.meoi_l3proto, meoi.meoi_l2hlen,
-			    &type, &indx) == -1) {
-				mac_rx_drop_pkt(mac_srs, mp);
-				continue;
-			}
-
-			DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
-			    mac_ether_offload_info_t *, &meoi,
-			    mac_soft_ring_set_t *, mac_srs, pkt_type_t, type);
-			FANOUT_ENQUEUE_MP(headmp[type][indx],
-			    tailmp[type][indx], cnt[type][indx],
-			    sz[type][indx], sz1, mp);
-			continue;
+		/*
+		 * Drivers should only be sending up M_DATA mblk chains with
+		 * one DB_REF, with L2/L3/L4 contiguous and padded by 2B at the
+		 * front to setup 4B-alignment for IP headers.
+		 *
+		 * Ideally we should be enforcing these as part of the driver
+		 * contract. In the meantime, fixup what we can here to allow
+		 * for hashing.
+		 */
+		if (DB_TYPE(mp) != M_DATA ||
+		    (meoi.meoi_flags & MEOI_L3INFO_SET) == 0) {
+			/*
+			 * We're ineligible for even L3 source/destination
+			 * fanout.
+			 */
+			goto enqueue;
 		}
 
 		/*
@@ -2207,171 +1809,152 @@ mac_rx_srs_fanout(mac_soft_ring_set_t *mac_srs, mblk_t *head)
 		 * can grant it a reprieve here.  This is acceptable since we
 		 * will not go rooting around in the ESP headers.
 		 */
-		if ((meoi.meoi_flags & MEOI_L3INFO_SET) != 0 &&
-		    (meoi.meoi_flags & MEOI_L4INFO_SET) == 0 &&
+		if ((meoi.meoi_flags & MEOI_L4INFO_SET) == 0 &&
 		    meoi.meoi_l4proto == IPPROTO_ESP) {
 			/* ESP header should consist of at least 8 octets */
 			meoi.meoi_l4hlen = 8;
 			meoi.meoi_flags |= MEOI_L4INFO_SET;
 		}
 
-		/*
-		 * If we are using the default Rx ring where H/W or S/W
-		 * classification has not happened, we need to verify if
-		 * this unicast packet really belongs to us.
-		 */
-		boolean_t is_fastpath = B_FALSE;
+		const boolean_t fragmented = (meoi.meoi_flags &
+		    (MEOI_L3_FRAG_MORE | MEOI_L3_FRAG_OFFSET)) != 0;
+
 		if (meoi.meoi_l3proto == ETHERTYPE_IP ||
 		    meoi.meoi_l3proto == ETHERTYPE_IPV6) {
 			/*
-			 * If we are H/W classified, but we have promisc
-			 * on, then we need to check for the unicast address.
+			 * If we are using the default Rx ring where H/W or S/W
+			 * classification has not happened, we need to verify if
+			 * this unicast packet really belongs to us.
 			 */
-			if (hw_classified && mcip->mci_promisc_list != NULL) {
+			if (verify_hw_classified) {
 				mac_address_t		*map;
 
 				rw_enter(&mcip->mci_rw_lock, RW_READER);
 				map = mcip->mci_unicast;
 				if (bcmp(dstaddr, map->ma_addr,
-				    map->ma_len) == 0)
-					is_fastpath = B_TRUE;
+				    map->ma_len) == 0) {
+					is_fastpath = !fragmented;
+				}
 				rw_exit(&mcip->mci_rw_lock);
 			} else if (is_unicast) {
-				is_fastpath = B_TRUE;
+				is_fastpath = !fragmented;
 			}
+		}
+
+		if ((!dls_bypass_v4 && meoi.meoi_l3proto == ETHERTYPE_IP) ||
+		    (!dls_bypass_v6 && meoi.meoi_l3proto == ETHERTYPE_IPV6)) {
+			is_fastpath = B_FALSE;
+		}
+
+		size_t total_hdr_len = meoi.meoi_l2hlen + meoi.meoi_l3hlen;
+		if ((meoi.meoi_flags & MEOI_L4INFO_SET) != 0) {
+			total_hdr_len += meoi.meoi_l4hlen;
+		} else {
+			is_fastpath = B_FALSE;
 		}
 
 		/*
-		 * Verify that the requirements for taking the fast path are all
-		 * still met.  This needs to become a contract with the driver.
+		 * Local loopback flows may push separate L2 from L3+4.
+		 * We can correct this and any misalignment for hashing.
 		 */
-		if (is_fastpath) {
-			if ((meoi.meoi_flags & MEOI_L3INFO_SET) == 0 ||
-			    (meoi.meoi_flags & MEOI_L4INFO_SET) == 0) {
-				is_fastpath = B_FALSE;
-			}
-			if (DB_TYPE(mp) != M_DATA || DB_REF(mp) != 1) {
-				is_fastpath = B_FALSE;
-			}
-
-			const size_t total_hdr_len = meoi.meoi_l2hlen
-			    + meoi.meoi_l3hlen + meoi.meoi_l4hlen;
-
-			if (!OK_32PTR(mp->b_rptr + meoi.meoi_l2hlen) ||
-			    total_hdr_len > MBLKL(mp)) {
-				is_fastpath = B_FALSE;
-			}
-
-			if ((meoi.meoi_flags &
-			    (MEOI_L3_FRAG_MORE | MEOI_L3_FRAG_OFFSET)) != 0) {
-				is_fastpath = B_FALSE;
-			}
-		}
-		switch (meoi.meoi_l4proto) {
-		case IPPROTO_TCP:
-		case IPPROTO_UDP:
-		case IPPROTO_SCTP:
-		case IPPROTO_ESP:
-			if (is_fastpath) {
+		if (total_hdr_len > MBLKL(mp) ||
+		    !OK_32PTR(mp->b_rptr + meoi.meoi_l2hlen)) {
+			const size_t pad = (4 - (meoi.meoi_l2hlen % 4)) % 4;
+			mblk_t *new_mp = msgpullup_pad(mp, total_hdr_len, pad);
+			if (new_mp != NULL) {
+				if (DB_CKSUMFLAGS(mp) != 0) {
+					mac_hcksum_clone(mp, new_mp);
+				}
+				freemsg(mp);
+				mp = new_mp;
+			} else {
 				/*
-				 * Since the above checks ensure that the first
-				 * mblk covers the L2-L4 headers, we can be
-				 * confident that the "ports" portion of the
-				 * hashing payload is covered too.
+				 * The allocb failed or the packet was shorter
+				 * than the advertised header length. Leave the
+				 * packet to DLS.
 				 */
-				ASSERT3U(meoi.meoi_l4hlen, >=, PORTS_SIZE);
+				goto enqueue;
 			}
-			break;
-		default:
-			break;
-		}
-
-		if (!is_fastpath) {
-			if (mac_rx_srs_long_fanout(mac_srs, mp,
-			    meoi.meoi_l3proto, meoi.meoi_l2hlen,
-			    &type, &indx) == -1) {
-				mac_rx_drop_pkt(mac_srs, mp);
-				continue;
-			}
-
-			DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
-			    mac_ether_offload_info_t *, &meoi,
-			    mac_soft_ring_set_t *, mac_srs, pkt_type_t, type);
-			FANOUT_ENQUEUE_MP(headmp[type][indx],
-			    tailmp[type][indx], cnt[type][indx],
-			    sz[type][indx], sz1, mp);
-			continue;
 		}
 
 		/*
-		 * By now, the fastpath requirements ensure that direct access
-		 * to the L3/L4 headers will fall safely within the mblk.
+		 * Stick to L3 address fanout for fragmented packets.
 		 */
-		const ipha_t *ipha = (ipha_t *)(mp->b_rptr + meoi.meoi_l2hlen);
-		const ip6_t *ip6 = (ip6_t *)(mp->b_rptr + meoi.meoi_l2hlen);
-		const uint32_t *ports = (uint32_t *)
-		    (mp->b_rptr + meoi.meoi_l2hlen + meoi.meoi_l3hlen);
+		if (fragmented || (meoi.meoi_flags & MEOI_L4INFO_SET) != 0) {
+			goto compute_index;
+		}
 
 		/*
-		 * XXX-Sunay: We should hold srs_lock since ring_count
-		 * below can change. But if we are always called from
-		 * mac_rx_srs_drain and SRS_PROC is set, then we can
-		 * enforce that ring_count can't be changed i.e.
-		 * to change fanout type or ring count, the calling
-		 * thread needs to be behind SRS_PROC.
+		 * By now, we have ensured that direct access to the L3/L4
+		 * headers will fall safely within the mblk.
 		 */
-		uint_t hash;
+		const size_t l4offset = meoi.meoi_l2hlen + meoi.meoi_l3hlen;
 		switch (meoi.meoi_l4proto) {
 		case IPPROTO_TCP:
+			/*
+			 * Since the above checks ensure that the first
+			 * mblk covers the L2-L4 headers, we can be
+			 * confident that the "ports" portion of the
+			 * hashing payload is covered too.
+			 */
+			ASSERT3U(meoi.meoi_l4hlen, >=, PORTS_SIZE);
 			/*
 			 * Note that for ESP, we fanout on SPI and it is at the
 			 * same offset as the 2x16-bit ports. So it is clumped
 			 * along with TCP, UDP and SCTP.
 			 */
-			if (meoi.meoi_l3proto == ETHERTYPE_IP) {
-				hash = HASH_ADDR(ipha->ipha_src, ipha->ipha_dst,
-				    *ports);
-				type = V4_TCP;
+			ports = *(uint32_t *)(mp->b_rptr + l4offset);
+			if (is_fastpath) {
+				ASSERT(meoi.meoi_l3proto == ETHERTYPE_IPV6 ||
+				    meoi.meoi_l3proto == ETHERTYPE_IPV4);
+				type = (meoi.meoi_l3proto == ETHERTYPE_IPV6) ?
+				    V6_TCP : V4_TCP;
+				mp->b_rptr += meoi.meoi_l2hlen;
 			}
-			if (meoi.meoi_l3proto == ETHERTYPE_IPV6) {
-				hash = HASH_ADDR6(ip6->ip6_src, ip6->ip6_dst,
-				    *ports);
-				type = V6_TCP;
-			}
-			indx = COMPUTE_INDEX(hash, mac_srs->srs_tcp_ring_count);
-			mp->b_rptr += meoi.meoi_l2hlen;
 			break;
 		case IPPROTO_UDP:
 		case IPPROTO_SCTP:
 		case IPPROTO_ESP:
-			if (mac_fanout_type == MAC_FANOUT_DEFAULT) {
-				if (meoi.meoi_l3proto == ETHERTYPE_IP) {
-					hash = HASH_ADDR(ipha->ipha_src,
-					    ipha->ipha_dst, *ports);
-				}
-				if (meoi.meoi_l3proto == ETHERTYPE_IPV6) {
-					hash = HASH_ADDR6(ip6->ip6_src,
-					    ip6->ip6_dst, *ports);
-				}
-				indx = COMPUTE_INDEX(hash,
-				    mac_srs->srs_udp_ring_count);
-			} else {
-				indx = mac_srs->srs_ind %
-				    mac_srs->srs_udp_ring_count;
-				mac_srs->srs_ind++;
+			ASSERT3U(meoi.meoi_l4hlen, >=, PORTS_SIZE);
+			ports = *(uint32_t *)(mp->b_rptr + l4offset);
+			if (is_fastpath) {
+				ASSERT(meoi.meoi_l3proto == ETHERTYPE_IPV6 ||
+				    meoi.meoi_l3proto == ETHERTYPE_IPV4);
+				type = (meoi.meoi_l3proto == ETHERTYPE_IPV6) ?
+				    V6_UDP : V4_UDP;
+				mp->b_rptr += meoi.meoi_l2hlen;
 			}
-			type = (meoi.meoi_l3proto == ETHERTYPE_IPV6) ?
-			    V6_UDP : V4_UDP;
-			mp->b_rptr += meoi.meoi_l2hlen;
 			break;
 		default:
-			indx = 0;
-			type = OTH;
+			break;
 		}
-
+compute_index:
+		if (fanout_cnt == 0) {
+			indx = 0;
+		} else if (mac_fanout_type == MAC_FANOUT_DEFAULT ||
+		    type == V4_TCP || type == V6_TCP) {
+			if (meoi.meoi_l3proto == ETHERTYPE_IP) {
+				const ipha_t *ipha = (ipha_t *)(mp->b_rptr +
+				    meoi.meoi_l2hlen);
+				hash = HASH_ADDR(ipha->ipha_src, ipha->ipha_dst,
+				    ports);
+			} else if (meoi.meoi_l3proto == ETHERTYPE_IPV6) {
+				const ip6_t *ip6 = (ip6_t *)(mp->b_rptr +
+				    meoi.meoi_l2hlen);
+				hash = HASH_ADDR6(ip6->ip6_src, ip6->ip6_dst,
+				    ports);
+			} else {
+				hash = HASH_HINT(ports);
+			}
+			indx = COMPUTE_INDEX(hash, fanout_cnt);
+		} else {
+			indx = mac_srs->srs_ind % fanout_cnt;
+			mac_srs->srs_ind++;
+		}
 		DTRACE_PROBE4(rx__fanout, mblk_t *, mp,
 		    mac_ether_offload_info_t *, &meoi, mac_soft_ring_set_t *,
 		    mac_srs, pkt_type_t, type);
+enqueue:
 		FANOUT_ENQUEUE_MP(headmp[type][indx], tailmp[type][indx],
 		    cnt[type][indx], sz[type][indx], sz1, mp);
 	}
@@ -2925,10 +2508,7 @@ again:
 		 * Since the fanout routines can deal with chains,
 		 * shoot the entire chain up.
 		 */
-		if (mac_srs->srs_type & SRST_FANOUT_SRC_IP)
-			mac_rx_srs_fanout(mac_srs, head);
-		else
-			mac_rx_srs_proto_fanout(mac_srs, head);
+		mac_rx_srs_fanout(mac_srs, head);
 		mutex_enter(&mac_srs->srs_lock);
 	}
 
@@ -3168,10 +2748,7 @@ again:
 		 * Since the fanout routines can deal with chains,
 		 * shoot the entire chain up.
 		 */
-		if (mac_srs->srs_type & SRST_FANOUT_SRC_IP)
-			mac_rx_srs_fanout(mac_srs, head);
-		else
-			mac_rx_srs_proto_fanout(mac_srs, head);
+		mac_rx_srs_fanout(mac_srs, head);
 		mutex_enter(&mac_srs->srs_lock);
 	}
 
