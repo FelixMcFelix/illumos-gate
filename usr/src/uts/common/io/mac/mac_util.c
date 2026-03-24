@@ -279,7 +279,7 @@ mac_sw_cksum_impl(mblk_t *mp, mac_emul_t emul, const uint32_t encap_len,
 	const size_t hdr_len_reqd = l4_off +
 	    (do_ulp_cksum ? meoi->meoi_l4hlen : 0);
 	if (MBLKL(target_mp) < hdr_len_reqd || DB_REF(target_mp) > 1) {
-		mblk_t *hdrmp = msgpullup(target_mp, hdr_len_reqd);
+		mblk_t *hdrmp = msgpullup_pad(target_mp, hdr_len_reqd, 2);
 
 		if (hdrmp == NULL) {
 			err = "could not pullup msg headers";
@@ -916,7 +916,7 @@ mac_sw_lso(mblk_t *omp, mac_emul_t emul, mblk_t **head, mblk_t **tail,
 	 */
 	const size_t hdr_len_reqd = encap_len + ohdrslen;
 	if (MBLKL(omp) < hdr_len_reqd) {
-		mblk_t *tmp = msgpullup(omp, hdr_len_reqd);
+		mblk_t *tmp = msgpullup_pad(omp, hdr_len_reqd, 2);
 		if (tmp == NULL) {
 			mac_drop_pkt(omp, "failed to pull up");
 			goto fail;
