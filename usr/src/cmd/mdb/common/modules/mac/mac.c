@@ -22,9 +22,11 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2018 Joyent, Inc.
+ * Copyright 2026 Oxide COmputer Company
  */
 
 #include <sys/mdb_modapi.h>
+#include <mdb/mdb_ctf.h>
 #include <sys/types.h>
 #include <inet/ip.h>
 #include <inet/ip6.h>
@@ -173,6 +175,138 @@ mac_flow_print_header(uint_t args)
 	}
 }
 
+typedef struct mdb_mac_impl {
+	char		mi_name[MAXNAMELEN];
+	uintptr_t	mi_rx_groups;
+	uintptr_t	mi_tx_groups;
+} mdb_mac_impl_t;
+
+typedef struct mdb_mac_client_impl {
+	char		mci_name[MAXNAMELEN];
+	uintptr_t	mci_mip;
+} mdb_mac_client_impl_t;
+
+typedef struct mdb_mac_soft_ring_set {
+	/*
+	 * mdb_ctf_vread cannot handle flagset-type enums.
+	 * The corresponding types are mac_soft_ring_set_type_t and
+	 * mac_soft_ring_set_state_t.
+	 */
+	uint32_t	srs_type;
+	uint32_t	srs_state;
+
+	uintptr_t	srs_mcip;
+	uintptr_t	srs_flent;
+	size_t		srs_size;
+	uint32_t	srs_count;
+	int		srs_soft_ring_count;
+	uintptr_t	srs_soft_ring_head;
+	int		srs_tx_ring_count;
+	uintptr_t	srs_ring;
+
+	struct {
+		mac_tx_srs_mode_t	st_mode;
+		uintptr_t		st_arg2;
+		struct {
+			uint64_t	mts_obytes;
+			uint64_t	mts_sdrops;
+			uint64_t	mts_blockcnt;
+			uint64_t	mts_unblockcnt;
+		} st_stat;
+	} srs_tx;
+
+	struct {
+		struct {
+			uint64_t	mrs_intrbytes;
+			uint64_t	mrs_pollbytes;
+			uint64_t	mrs_lclbytes;
+			uint64_t	mrs_intrcnt;
+			uint64_t	mrs_pollcnt;
+			uint64_t	mrs_lclcnt;
+			uint64_t	mrs_chaincntundr10;
+			uint64_t	mrs_chaincnt10to50;
+			uint64_t	mrs_chaincntover50;
+		} sr_stat;
+	} srs_rx;
+
+	struct {
+		uint32_t	mc_ncpus;
+		uint32_t	mc_cpus[MRP_NCPUS];
+		uint32_t	mc_rx_pollid;
+		uint32_t	mc_rx_workerid;
+		uint32_t	mc_rx_fanout_cnt;
+		uint32_t	mc_rx_fanout_cpus[MRP_NCPUS];
+		int32_t		mc_rx_intr_cpu;
+		int32_t		mc_tx_fanout_cpus[MRP_NCPUS];
+		struct {
+			int32_t		mtc_intr_cpu[MRP_NCPUS];
+			int32_t		mtc_retargeted_cpu[MRP_NCPUS];
+		} mc_tx_intr_cpus;
+	} srs_cpu;
+} mdb_mac_soft_ring_set_t;
+
+typedef struct mdb_mac_ring {
+	struct {
+		struct {
+			boolean_t	mi_ddi_shared;
+		} mri_intr;
+	} mr_info;
+	uintptr_t		mr_srs;
+	mac_ring_type_t 	mr_type;
+	mac_ring_state_t	mr_state;
+	uint_t			mr_flag;
+	uintptr_t		mr_gh;
+	mac_classify_type_t	mr_classify_type;
+} mdb_mac_ring_t;
+
+typedef struct mdb_mac_soft_ring {
+	uintptr_t	s_ring_next;
+	uintptr_t	s_ring_tx_arg2;
+
+	struct {
+		uint64_t	mts_sdrops;
+		uint64_t	mts_blockcnt;
+		uint64_t	mts_unblockcnt;
+	} s_st_stat;
+} mdb_mac_soft_ring_t;
+
+typedef struct mdb_flow_entry {
+	/*
+	 * mdb_ctf_vread cannot handle flagset-type enums.
+	 * The corresponding types are flow_entry_type_t and
+	 * flow_entry_flags_t.
+	 */
+	uint32_t	fe_type;
+	uint32_t	fe_flags;
+
+	char		fe_flow_name[MAXFLOWNAMELEN];
+	uint32_t	fe_rx_srs_cnt;
+	uintptr_t	fe_rx_srs[MAX_RINGS_PER_GROUP];
+	uintptr_t	fe_tx_srs;
+	uintptr_t	fe_mcip;
+	uintptr_t	fe_match;
+	datalink_id_t	fe_link_id;
+	struct {
+		uint64_t		mrp_maxbw;
+		mac_priority_level_t	mrp_priority;
+	} fe_resource_props;
+	// flow_desc_t		fe_flow_desc
+} mdb_flow_entry_t;
+
+typedef struct mdb_mac_group {
+	mac_ring_type_t		mrg_type;
+	mac_group_state_t	mrg_state;
+	uintptr_t		mrg_mh;
+	uintptr_t		mrg_next;
+	uintptr_t		mrg_clients;
+	uint_t			mrg_cur_count;
+	uintptr_t		mrg_rings;
+} mdb_mac_group_t;
+
+typedef struct mdb_mac_grp_client {
+	uintptr_t	mgc_next;
+} mdb_mac_grp_client_t;
+
 /*
  * Display selected fields of the flow_entry_t structure
  */
@@ -203,12 +337,14 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		{ NULL, 0, 0 }
 	};
 #define	FLOW_MAX_FLAGS	(sizeof (flow_flag_bits) / sizeof (mdb_bitmask_t))
-	flow_entry_t		fe;
-	mac_client_impl_t	mcip;
-	mac_impl_t		mip;
+	mdb_flow_entry_t	fe;
+	mdb_mac_client_impl_t	mcip;
+	mdb_mac_impl_t		mip;
 
-	if (mdb_vread(&fe, sizeof (fe), addr) == -1) {
-		mdb_warn("failed to read struct flow_entry_s at %p", addr);
+	if (mdb_ctf_vread(&fe, "flow_entry_t",
+	    "mdb_flow_entry_t", addr, 0) == -1) {
+		mdb_warn("failed to read struct flow_entry_s at %p",
+		    addr);
 		return (DCMD_ERR);
 	}
 	if (args & MAC_FLOW_USER) {
@@ -223,9 +359,10 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		mac_flow_print_header(args);
 	bzero(&mcip, sizeof (mcip));
 	bzero(&mip, sizeof (mip));
-	if (fe.fe_mcip != NULL && mdb_vread(&mcip, sizeof (mcip),
-	    (uintptr_t)fe.fe_mcip) == sizeof (mcip)) {
-		(void) mdb_vread(&mip, sizeof (mip), (uintptr_t)mcip.mci_mip);
+	if (fe.fe_mcip != (uintptr_t)NULL && mdb_ctf_vread(&mcip,
+	   "mac_client_impl_t", "mdb_mac_client_impl_t", fe.fe_mcip, 0) != -1) {
+		(void) mdb_ctf_vread(&mip, "mac_impl_t", "mdb_mac_impl_t",
+		    mcip.mci_mip, 0);
 	}
 	switch (args) {
 	case MAC_FLOW_NONE: {
@@ -240,6 +377,7 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		uintptr_t	desc_addr;
 		flow_desc_t	fdesc;
 
+		// TODO(ky)
 		desc_addr = addr + OFFSETOF(flow_entry_t, fe_flow_desc);
 		if (mdb_vread(&fdesc, sizeof (fdesc), desc_addr) == -1) {
 			mdb_warn("failed to read struct flow_description at %p",
@@ -264,21 +402,13 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		break;
 	}
 	case MAC_FLOW_PROP: {
-		uintptr_t	prop_addr;
 		char		bwstr[STRSIZE];
-		mac_resource_props_t	fprop;
-
-		prop_addr = addr + OFFSETOF(flow_entry_t, fe_resource_props);
-		if (mdb_vread(&fprop, sizeof (fprop), prop_addr) == -1) {
-			mdb_warn("failed to read struct mac_resoource_props "
-			    "at %p", prop_addr);
-			return (DCMD_ERR);
-		}
 		mdb_printf("%?p %-32s "
 		    "%8s %9s\n",
 		    addr, fe.fe_flow_name,
-		    mac_flow_bw2str(fprop.mrp_maxbw, bwstr, STRSIZE),
-		    mac_flow_priority2str(fprop.mrp_priority));
+		    mac_flow_bw2str(fe.fe_resource_props.mrp_maxbw, bwstr,
+		    STRSIZE),
+		    mac_flow_priority2str(fe.fe_resource_props.mrp_priority));
 		break;
 	}
 	case MAC_FLOW_MISC: {
@@ -286,11 +416,8 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		char		flow_type[2 * FLOW_MAX_TYPE];
 		GElf_Sym	sym;
 		char		func_name[MDB_SYM_NAMLEN] = "";
-		uintptr_t	func, match_addr;
 
-		match_addr = addr + OFFSETOF(flow_entry_t, fe_match);
-		(void) mdb_vread(&func, sizeof (func), match_addr);
-		(void) mdb_lookup_by_addr(func, MDB_SYM_EXACT, func_name,
+		(void) mdb_lookup_by_addr(fe.fe_match, MDB_SYM_EXACT, func_name,
 		    MDB_SYM_NAMLEN, &sym);
 		mdb_snprintf(flow_flags, 2 * FLOW_MAX_FLAGS, "%hb",
 		    fe.fe_flags, flow_flag_bits);
@@ -301,26 +428,17 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 		break;
 	}
 	case MAC_FLOW_RX: {
-		uintptr_t	rxaddr, rx_srs[MAX_RINGS_PER_GROUP] = {0};
-		int		i;
-
-		rxaddr = addr + OFFSETOF(flow_entry_t, fe_rx_srs);
-		(void) mdb_vread(rx_srs, MAC_RX_SRS_SIZE, rxaddr);
 		mdb_printf("%?p %-24s %3d ",
 		    addr, fe.fe_flow_name, fe.fe_rx_srs_cnt);
-		for (i = 0; i < MAX_RINGS_PER_GROUP; i++) {
-			if (rx_srs[i] == 0)
+		for (int i = 0; i < MAX_RINGS_PER_GROUP; i++) {
+			if (fe.fe_rx_srs[i] == (uintptr_t)NULL)
 				continue;
-			mdb_printf("%p ", rx_srs[i]);
+			mdb_printf("%p ", fe.fe_rx_srs[i]);
 		}
 		mdb_printf("\n");
 		break;
 	}
 	case MAC_FLOW_TX: {
-		uintptr_t	tx_srs = 0, txaddr;
-
-		txaddr = addr + OFFSETOF(flow_entry_t, fe_tx_srs);
-		(void) mdb_vread(&tx_srs, sizeof (uintptr_t), txaddr);
 		mdb_printf("%?p %-32s %?p\n",
 		    addr, fe.fe_flow_name, fe.fe_tx_srs);
 		break;
@@ -328,41 +446,39 @@ mac_flow_dcmd_output(uintptr_t addr, uint_t flags, uint_t args)
 	case MAC_FLOW_STATS: {
 		uint64_t		totibytes = 0;
 		uint64_t		totobytes = 0;
-		mac_soft_ring_set_t	*mac_srs;
-		mac_rx_stats_t		mac_rx_stat;
-		mac_tx_stats_t		mac_tx_stat;
+		mdb_mac_soft_ring_set_t	srs;
 		int			i;
 
 		/*
 		 * Sum bytes for all Rx SRS.
 		 */
 		for (i = 0; i < fe.fe_rx_srs_cnt; i++) {
-			mac_srs = (mac_soft_ring_set_t *)(fe.fe_rx_srs[i]);
-			if (mdb_vread(&mac_rx_stat, sizeof (mac_rx_stats_t),
-			    (uintptr_t)&mac_srs->srs_rx.sr_stat) == -1) {
+			if (mdb_ctf_vread(&srs, "mac_soft_ring_set_t",
+			    "mdb_mac_soft_ring_set_t", fe.fe_rx_srs[i],
+			    0) == -1) {
 				mdb_warn("failed to read mac_rx_stats_t at %p",
-				    &mac_srs->srs_rx.sr_stat);
+				    fe.fe_rx_srs[i]);
 				return (DCMD_ERR);
 			}
 
-			totibytes += mac_rx_stat.mrs_intrbytes +
-			    mac_rx_stat.mrs_pollbytes +
-			    mac_rx_stat.mrs_lclbytes;
+			totibytes += srs.srs_rx.sr_stat.mrs_intrbytes +
+			    srs.srs_rx.sr_stat.mrs_pollbytes +
+			    srs.srs_rx.sr_stat.mrs_lclbytes;
 		}
 
 		/*
 		 * Sum bytes for Tx SRS.
 		 */
-		mac_srs = (mac_soft_ring_set_t *)(fe.fe_tx_srs);
-		if (mac_srs != NULL) {
-			if (mdb_vread(&mac_tx_stat, sizeof (mac_tx_stats_t),
-			    (uintptr_t)&mac_srs->srs_tx.st_stat) == -1) {
-				mdb_warn("failed to read max_tx_stats_t at %p",
-				    &mac_srs->srs_tx.st_stat);
+		if (fe.fe_tx_srs != (uintptr_t)NULL) {
+			if (mdb_ctf_vread(&srs, "mac_soft_ring_set_t",
+			    "mdb_mac_soft_ring_set_t", fe.fe_tx_srs,
+			    0) == -1) {
+				mdb_warn("failed to read mac_rx_stats_t at %p",
+				    fe.fe_tx_srs);
 				return (DCMD_ERR);
 			}
 
-			totobytes = mac_tx_stat.mts_obytes;
+			totobytes = srs.srs_tx.st_stat.mts_obytes;
 		}
 
 		mdb_printf("%?p %-32s %16llu %16llu\n",
@@ -564,8 +680,6 @@ static int
 mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 {
 	uint_t			args = MAC_SRS_NONE;
-	mac_soft_ring_set_t	srs;
-	mac_client_impl_t	mci;
 
 	if (!(flags & DCMD_ADDRSPEC)) {
 		if (mdb_walk_dcmd("mac_srs", "mac_srs", argc, argv) == -1) {
@@ -588,12 +702,17 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 	if (argc > 2)
 		return (DCMD_USAGE);
 
-	if (mdb_vread(&srs, sizeof (srs), addr) == -1) {
+	mdb_mac_soft_ring_set_t srs;
+	if (mdb_ctf_vread(&srs, "mac_soft_ring_set_t",
+	    "mdb_mac_soft_ring_set_t", addr, 0) == -1) {
 		mdb_warn("failed to read struct mac_soft_ring_set_s at %p",
 		    addr);
 		return (DCMD_ERR);
 	}
-	if (mdb_vread(&mci, sizeof (mci), (uintptr_t)srs.srs_mcip) == -1) {
+
+	mdb_mac_client_impl_t mci;
+	if (mdb_ctf_vread(&srs, "mac_client_impl_t",
+	    "mdb_mac_client_impl_t", srs.srs_mcip, 0) == -1) {
 		mdb_warn("failed to read struct mac_client_impl_t at %p "
 		    "for SRS %p", srs.srs_mcip, addr);
 		return (DCMD_ERR);
@@ -641,8 +760,6 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		break;
 	}
 	case MAC_SRS_RXCPU: {
-		mac_cpus_t	mc = srs.srs_cpu;
-
 		if (DCMD_HDRSPEC(flags)) {
 			mdb_printf("%?s %-20s %-4s %-4s "
 			    "%-6s %-4s %-7s\n",
@@ -657,14 +774,15 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 			return (DCMD_OK);
 		mdb_printf("%?p %-20s %-4d %-4d "
 		    "%-6d %-4d %-7d\n",
-		    addr, mci.mci_name, mc.mc_ncpus, mc.mc_rx_pollid,
-		    mc.mc_rx_workerid, mc.mc_rx_intr_cpu, mc.mc_rx_fanout_cnt);
+		    addr, mci.mci_name, srs.srs_cpu.mc_ncpus,
+		    srs.srs_cpu.mc_rx_pollid, srs.srs_cpu.mc_rx_workerid,
+		    srs.srs_cpu.mc_rx_intr_cpu, srs.srs_cpu.mc_rx_fanout_cnt);
 		break;
 
 	}
 	case MAC_SRS_TXCPU: {
-		mac_cpus_t	mc = srs.srs_cpu;
-		mac_soft_ring_t *s_ringp, s_ring;
+		uintptr_t		s_ringp;
+		mdb_mac_soft_ring_t	s_ring;
 		boolean_t	first = B_TRUE;
 		int		i;
 
@@ -685,34 +803,35 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		 */
 		if (srs.srs_tx_ring_count == 0) {
 			mdb_printf("%?p %8d %8d %8d\n",
-			    0, mc.mc_tx_fanout_cpus[0],
-			    mc.mc_tx_intr_cpu[0],
-			    mc.mc_tx_retargeted_cpu[0]);
+			    0, srs.srs_cpu.mc_tx_fanout_cpus[0],
+			    srs.srs_cpu.mc_tx_intr_cpus.mtc_intr_cpu[0],
+			    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[0]);
 			break;
 		}
 
-		for (s_ringp = srs.srs_soft_ring_head, i = 0; s_ringp != NULL;
+		for (s_ringp = srs.srs_soft_ring_head, i = 0; s_ringp != (uintptr_t)NULL;
 		    s_ringp = s_ring.s_ring_next, i++) {
-			(void) mdb_vread(&s_ring, sizeof (s_ring),
-			    (uintptr_t)s_ringp);
+			(void) mdb_ctf_vread(&s_ring, "mac_soft_ring_t",
+			    "mdb_mac_soft_ring_t", s_ringp, 0);
 			if (first) {
 				mdb_printf("%?p %8d %8d %8d\n",
-				    s_ringp, mc.mc_tx_fanout_cpus[i],
-				    mc.mc_tx_intr_cpu[i],
-				    mc.mc_tx_retargeted_cpu[i]);
+				    s_ringp, srs.srs_cpu.mc_tx_fanout_cpus[i],
+				    srs.srs_cpu.mc_tx_intr_cpus.mtc_intr_cpu[i],
+				    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[i]);
 				first = B_FALSE;
 				continue;
 			}
 			mdb_printf("%?s %-12s %?p %8d %8d %8d\n",
-			    "", "", s_ringp, mc.mc_tx_fanout_cpus[i],
-			    mc.mc_tx_intr_cpu[i], mc.mc_tx_retargeted_cpu[i]);
+			    "", "", s_ringp, srs.srs_cpu.mc_tx_fanout_cpus[i],
+			    srs.srs_cpu.mc_tx_intr_cpus.mtc_intr_cpu[i],
+			    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[i]);
 		}
 		break;
 	}
 	case MAC_SRS_TXINTR: {
-		mac_cpus_t	mc = srs.srs_cpu;
-		mac_soft_ring_t *s_ringp, s_ring;
-		mac_ring_t	*m_ringp, m_ring;
+		uintptr_t	s_ringp, m_ringp;
+		mdb_mac_soft_ring_t	s_ring;
+		mdb_mac_ring_t		m_ring;
 		boolean_t	first = B_TRUE;
 		int		i;
 
@@ -734,47 +853,48 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		 */
 		if (srs.srs_tx_ring_count == 0) {
 			m_ringp = srs.srs_tx.st_arg2;
-			if (m_ringp != NULL) {
-				(void) mdb_vread(&m_ring, sizeof (m_ring),
-				    (uintptr_t)m_ringp);
+			if (m_ringp != (uintptr_t)NULL) {
+				(void) mdb_ctf_vread(&m_ring, "mac_ring_t",
+				    "mdb_mac_ring_t", m_ringp, 0);
 				mdb_printf("%?p %8d %?p %6d %6d\n",
-				    0, mc.mc_tx_fanout_cpus[0], m_ringp,
+				    0, srs.srs_cpu.mc_tx_fanout_cpus[0],
+				    m_ringp,
 				    m_ring.mr_info.mri_intr.mi_ddi_shared,
-				    mc.mc_tx_retargeted_cpu[0]);
+				    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[0]);
 			} else {
 				mdb_printf("%?p %8d %?p %6d %6d\n",
-				    0, mc.mc_tx_fanout_cpus[0], 0,
-				    0, mc.mc_tx_retargeted_cpu[0]);
+				    0, srs.srs_cpu.mc_tx_fanout_cpus[0], 0,
+				    0, srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[0]);
 			}
 			break;
 		}
 
-		for (s_ringp = srs.srs_soft_ring_head, i = 0; s_ringp != NULL;
-		    s_ringp = s_ring.s_ring_next, i++) {
-			(void) mdb_vread(&s_ring, sizeof (s_ring),
-			    (uintptr_t)s_ringp);
+		for (s_ringp = srs.srs_soft_ring_head, i = 0;
+		    s_ringp != (uintptr_t)NULL; s_ringp = s_ring.s_ring_next, i++) {
+			(void) mdb_ctf_vread(&s_ring, "mac_soft_ring_t",
+			    "mdb_mac_soft_ring_t", s_ringp, 0);
 			m_ringp = s_ring.s_ring_tx_arg2;
-			(void) mdb_vread(&m_ring, sizeof (m_ring),
-			    (uintptr_t)m_ringp);
+			(void) mdb_ctf_vread(&m_ring, "mac_ring_t",
+			    "mdb_mac_ring_t", m_ringp, 0);
 			if (first) {
 				mdb_printf("%?p %8d %?p %6d %6d\n",
-				    s_ringp, mc.mc_tx_fanout_cpus[i],
+				    s_ringp, srs.srs_cpu.mc_tx_fanout_cpus[i],
 				    m_ringp,
 				    m_ring.mr_info.mri_intr.mi_ddi_shared,
-				    mc.mc_tx_retargeted_cpu[i]);
+				    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[i]);
 				first = B_FALSE;
 				continue;
 			}
 			mdb_printf("%?s %-12s %?p %8d %?p %6d %6d\n",
-			    "", "", s_ringp, mc.mc_tx_fanout_cpus[i],
+			    "", "", s_ringp, srs.srs_cpu.mc_tx_fanout_cpus[i],
 			    m_ringp, m_ring.mr_info.mri_intr.mi_ddi_shared,
-			    mc.mc_tx_retargeted_cpu[i]);
+			    srs.srs_cpu.mc_tx_intr_cpus.mtc_retargeted_cpu[i]);
 		}
 		break;
 	}
 	case MAC_SRS_RXINTR: {
-		mac_cpus_t	mc = srs.srs_cpu;
-		mac_ring_t	*m_ringp, m_ring;
+		uintptr_t	m_ringp;
+		mac_ring_t	m_ring;
 
 		if (DCMD_HDRSPEC(flags)) {
 			mdb_printf("%?s %-12s %?s %8s %6s %6s\n",
@@ -789,21 +909,21 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		mdb_printf("%?p %-12s ", addr, mci.mci_name);
 
 		m_ringp = srs.srs_ring;
-		if (m_ringp != NULL) {
-			(void) mdb_vread(&m_ring, sizeof (m_ring),
-			    (uintptr_t)m_ringp);
+		if (m_ringp != (uintptr_t)NULL) {
+			(void) mdb_ctf_vread(&m_ring, "mac_ring_t",
+			    "mdb_mac_ring_t", m_ringp, 0);
 			mdb_printf("%?p %8d %6d %6d\n",
 			    m_ringp, m_ring.mr_info.mri_intr.mi_ddi_shared,
-			    mc.mc_rx_pollid, mc.mc_rx_intr_cpu);
+			    srs.srs_cpu.mc_rx_pollid, srs.srs_cpu.mc_rx_intr_cpu);
 		} else {
 			mdb_printf("%?p %8d %6d %6d\n",
-			    0, 0, mc.mc_rx_pollid, mc.mc_rx_intr_cpu);
+			    0, 0, srs.srs_cpu.mc_rx_pollid,
+			    srs.srs_cpu.mc_rx_intr_cpu);
 		}
 		break;
 	}
 	case MAC_SRS_RXCPUVERBOSE:
 	case MAC_SRS_TXCPUVERBOSE: {
-		mac_cpus_t	mc = srs.srs_cpu;
 		int		cpu_index = 0, fanout_index = 0, len = 0;
 		boolean_t	cpu_done = B_FALSE, fanout_done = B_FALSE;
 
@@ -819,9 +939,11 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		    ((args & MAC_SRS_RX) && (srs.srs_type & SRST_TX)))
 			return (DCMD_OK);
 		mdb_printf("%?p %-20s %-20d %-20d\n", addr, mci.mci_name,
-		    mc.mc_ncpus, mc.mc_rx_fanout_cnt);
-		if (mc.mc_ncpus == 0 && mc.mc_rx_fanout_cnt == 0)
+		    srs.srs_cpu.mc_ncpus, srs.srs_cpu.mc_rx_fanout_cnt);
+		if (srs.srs_cpu.mc_ncpus == 0 &&
+		    srs.srs_cpu.mc_rx_fanout_cnt == 0) {
 			break;
+		}
 		/* print all cpus and cpus for soft rings */
 		while (!cpu_done || !fanout_done) {
 			boolean_t old_value = cpu_done;
@@ -829,7 +951,8 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 			if (!cpu_done) {
 				mdb_printf("%?s %20s ", "", "");
 				cpu_done = mac_srs_print_cpu(&cpu_index,
-				    mc.mc_ncpus, mc.mc_cpus, &len);
+				    srs.srs_cpu.mc_ncpus, srs.srs_cpu.mc_cpus,
+				    &len);
 			}
 			if (!fanout_done) {
 				if (old_value)
@@ -837,16 +960,14 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 				else
 					mdb_printf("%*s", len, "");
 				fanout_done = mac_srs_print_cpu(&fanout_index,
-				    mc.mc_rx_fanout_cnt,
-				    mc.mc_rx_fanout_cpus, NULL);
+				    srs.srs_cpu.mc_rx_fanout_cnt,
+				    srs.srs_cpu.mc_rx_fanout_cpus, NULL);
 			}
 			mdb_printf("\n");
 		}
 		break;
 	}
 	case MAC_SRS_RXSTAT: {
-		mac_rx_stats_t *mac_rx_stat = &srs.srs_rx.sr_stat;
-
 		if (DCMD_HDRSPEC(flags)) {
 			mdb_printf("%?s %-16s %8s %8s "
 			    "%8s %8s %8s\n",
@@ -862,16 +983,16 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		mdb_printf("%?p %-16s %8d "
 		    "%8d %8d "
 		    "%8d %8d\n",
-		    addr, mci.mci_name, mac_rx_stat->mrs_intrcnt,
-		    mac_rx_stat->mrs_pollcnt, mac_rx_stat->mrs_chaincntundr10,
-		    mac_rx_stat->mrs_chaincnt10to50,
-		    mac_rx_stat->mrs_chaincntover50);
+		    addr, mci.mci_name, srs.srs_rx.sr_stat.mrs_intrcnt,
+		    srs.srs_rx.sr_stat.mrs_pollcnt, srs.srs_rx.sr_stat.mrs_chaincntundr10,
+		    srs.srs_rx.sr_stat.mrs_chaincnt10to50,
+		    srs.srs_rx.sr_stat.mrs_chaincntover50);
 		break;
 	}
 	case MAC_SRS_TXSTAT: {
-		mac_tx_stats_t *mac_tx_stat = &srs.srs_tx.st_stat;
-		mac_soft_ring_t *s_ringp, s_ring;
-		boolean_t	first = B_TRUE;
+		uintptr_t		s_ringp;
+		mdb_mac_soft_ring_t	s_ring;
+		boolean_t		first = B_TRUE;
 
 		if (DCMD_HDRSPEC(flags)) {
 			mdb_printf("%?s %-20s %?s %8s %8s %8s\n",
@@ -891,29 +1012,28 @@ mac_srs_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		 */
 		if (srs.srs_tx_ring_count == 0) {
 			mdb_printf("%?p %8d %8d %8d\n",
-			    0, mac_tx_stat->mts_sdrops,
-			    mac_tx_stat->mts_blockcnt,
-			    mac_tx_stat->mts_unblockcnt);
+			    0, srs.srs_tx.st_stat.mts_sdrops,
+			    srs.srs_tx.st_stat.mts_blockcnt,
+			    srs.srs_tx.st_stat.mts_unblockcnt);
 			break;
 		}
 
-		for (s_ringp = srs.srs_soft_ring_head; s_ringp != NULL;
-		    s_ringp = s_ring.s_ring_next) {
-			(void) mdb_vread(&s_ring, sizeof (s_ring),
-			    (uintptr_t)s_ringp);
-			mac_tx_stat = &s_ring.s_st_stat;
+		for (s_ringp = srs.srs_soft_ring_head;
+		    s_ringp != (uintptr_t)NULL; s_ringp = s_ring.s_ring_next) {
+			(void) mdb_ctf_vread(&s_ring, "mac_soft_ring_t",
+			    "mdb_mac_soft_ring_t", s_ringp, 0);
 			if (first) {
 				mdb_printf("%?p %8d %8d %8d\n",
-				    s_ringp, mac_tx_stat->mts_sdrops,
-				    mac_tx_stat->mts_blockcnt,
-				    mac_tx_stat->mts_unblockcnt);
+				    s_ringp, s_ring.s_st_stat.mts_sdrops,
+				    s_ring.s_st_stat.mts_blockcnt,
+				    s_ring.s_st_stat.mts_unblockcnt);
 				first = B_FALSE;
 				continue;
 			}
 			mdb_printf("%?s %-20s %?p %8d %8d %8d\n",
-			    "", "", s_ringp, mac_tx_stat->mts_sdrops,
-			    mac_tx_stat->mts_blockcnt,
-			    mac_tx_stat->mts_unblockcnt);
+			    "", "", s_ringp, s_ring.s_st_stat.mts_sdrops,
+			    s_ring.s_st_stat.mts_blockcnt,
+			    s_ring.s_st_stat.mts_unblockcnt);
 		}
 		break;
 	}
@@ -977,10 +1097,10 @@ mac_ring_classify2str(mac_classify_type_t classify)
 static int
 mac_ring_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 {
-	mac_ring_t		ring;
-	mac_group_t		group;
-	flow_entry_t		flent;
-	mac_soft_ring_set_t	srs;
+	mdb_mac_ring_t		ring;
+	mdb_mac_group_t		group;
+	mdb_flow_entry_t	flent;
+	mdb_mac_soft_ring_set_t	srs;
 
 	if (!(flags & DCMD_ADDRSPEC)) {
 		if (mdb_walk_dcmd("mac_ring", "mac_ring", argc, argv) == -1) {
@@ -989,16 +1109,18 @@ mac_ring_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		}
 		return (DCMD_OK);
 	}
-	if (mdb_vread(&ring, sizeof (ring), addr) == -1) {
+	if (mdb_ctf_vread(&ring, "mac_ring_t", "mac_mac_ring_t", addr, 0) == -1) {
 		mdb_warn("failed to read struct mac_ring_s at %p", addr);
 		return (DCMD_ERR);
 	}
 	bzero(&flent, sizeof (flent));
-	if (mdb_vread(&srs, sizeof (srs), (uintptr_t)ring.mr_srs) != -1) {
-		(void) mdb_vread(&flent, sizeof (flent),
-		    (uintptr_t)srs.srs_flent);
+	if (mdb_ctf_vread(&srs, "mac_soft_ring_set_t",
+	    "mdb_mac_soft_ring_set_t", ring.mr_srs, 0) != -1) {
+		(void) mdb_ctf_vread(&srs, "flow_entry_t", "mac_flow_entry_t",
+		    srs.srs_flent, 0);
 	}
-	(void) mdb_vread(&group, sizeof (group), (uintptr_t)ring.mr_gh);
+	(void) mdb_ctf_vread(&group, "mac_group_t", "mdb_mac_group_t",
+	    ring.mr_gh, 0);
 	if (DCMD_HDRSPEC(flags)) {
 		mdb_printf("%<u>%?s %4s %5s %4s %?s "
 		    "%5s %?s %?s %s %</u>\n",
@@ -1063,8 +1185,8 @@ static int
 mac_group_walk_step(mdb_walk_state_t *wsp)
 {
 	int ret;
-	mac_impl_t mi;
-	mac_group_t mg;
+	mdb_mac_impl_t mi;
+	mdb_mac_group_t mg;
 	uintptr_t mgp;
 
 	/*
@@ -1075,7 +1197,8 @@ mac_group_walk_step(mdb_walk_state_t *wsp)
 	if (wsp->walk_addr == 0)
 		return (WALK_DONE);
 
-	if (mdb_vread(&mi, sizeof (mac_impl_t), wsp->walk_addr) == -1) {
+	if (mdb_ctf_vread(&mi, "mac_impl_t", "mdb_mac_impl_t", wsp->walk_addr,
+	    0) == -1) {
 		mdb_warn("failed to read mac_impl_t at %p", wsp->walk_addr);
 		return (DCMD_ERR);
 	}
@@ -1085,9 +1208,10 @@ mac_group_walk_step(mdb_walk_state_t *wsp)
 	 */
 	mgp = (uintptr_t)mi.mi_rx_groups;
 	while (mgp != 0) {
-		if (mdb_vread(&mg, sizeof (mac_group_t), mgp) == -1) {
+		if (mdb_ctf_vread(&mg, "mac_group_t", "mdb_mac_group_t", mgp,
+		    0) == -1) {
 			mdb_warn("failed to read mac_group_t at %p", mgp);
-			return (WALK_ERR);
+			return (DCMD_ERR);
 		}
 
 		ret = wsp->walk_callback(mgp, &mg, wsp->walk_cbdata);
@@ -1098,9 +1222,10 @@ mac_group_walk_step(mdb_walk_state_t *wsp)
 
 	mgp = (uintptr_t)mi.mi_tx_groups;
 	while (mgp != 0) {
-		if (mdb_vread(&mg, sizeof (mac_group_t), mgp) == -1) {
+		if (mdb_ctf_vread(&mg, "mac_group_t", "mdb_mac_group_t", mgp,
+		    0) == -1) {
 			mdb_warn("failed to read mac_group_t at %p", mgp);
-			return (WALK_ERR);
+			return (DCMD_ERR);
 		}
 
 		ret = wsp->walk_callback(mgp, &mg, wsp->walk_cbdata);
@@ -1113,15 +1238,16 @@ mac_group_walk_step(mdb_walk_state_t *wsp)
 }
 
 static int
-mac_group_count_clients(mac_group_t *mgp)
+mac_group_count_clients(mdb_mac_group_t *mgp)
 {
 	int clients = 0;
 	uintptr_t mcp = (uintptr_t)mgp->mrg_clients;
 
 	while (mcp != 0) {
-		mac_grp_client_t c;
+		mdb_mac_grp_client_t c;
 
-		if (mdb_vread(&c, sizeof (c), mcp) == -1) {
+		if (mdb_ctf_vread(&c, "mac_grp_client_t",
+		    "mdb_mac_grp_client_t", mcp, 0) == -1) {
 			mdb_warn("failed to read mac_grp_client_t at %p", mcp);
 			return (-1);
 		}
@@ -1133,7 +1259,7 @@ mac_group_count_clients(mac_group_t *mgp)
 }
 
 static const char *
-mac_group_type(mac_group_t *mgp)
+mac_group_type(mdb_mac_group_t *mgp)
 {
 	const char *ret;
 
@@ -1153,7 +1279,7 @@ mac_group_type(mac_group_t *mgp)
 }
 
 static const char *
-mac_group_state(mac_group_t *mgp)
+mac_group_state(mdb_mac_group_t *mgp)
 {
 	const char *ret;
 
@@ -1182,7 +1308,7 @@ static int
 mac_group_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 {
 	uint_t		args = MAC_SRS_NONE;
-	mac_group_t	mg;
+	mdb_mac_group_t	mg;
 	int		clients;
 
 	if (!(flags & DCMD_ADDRSPEC)) {
@@ -1201,7 +1327,8 @@ mac_group_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 	    NULL) != argc)
 		return (DCMD_USAGE);
 
-	if (mdb_vread(&mg, sizeof (mac_group_t), addr) == -1) {
+	if (mdb_ctf_vread(&mg, "mac_group_t", "mdb_mac_group_t", addr,
+	    0) == -1) {
 		mdb_warn("failed to read mac_group_t at %p", addr);
 		return (DCMD_ERR);
 	}
