@@ -1576,6 +1576,8 @@ dir  path=opt/util-tests/tests/find
 file path=opt/util-tests/tests/find/find.kshlib mode=0555
 file path=opt/util-tests/tests/find/findroot mode=0555
 file path=opt/util-tests/tests/find/findtest mode=0555
+dir  path=opt/util-tests/tests/flowadm
+file path=opt/util-tests/tests/flowadm/create-flow mode=0555
 file path=opt/util-tests/tests/grep_test mode=0555
 dir  path=opt/util-tests/tests/head
 file path=opt/util-tests/tests/head/5221.in mode=0444

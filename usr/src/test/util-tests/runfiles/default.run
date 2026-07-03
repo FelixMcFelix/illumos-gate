@@ -17,6 +17,7 @@
 # Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
 # Copyright 2026 Hans Rosenfeld
 # Copyright 2026 Jason King
+# Copyright 2026 Oxide Computer Company
 #
 
 [DEFAULT]
@@ -45,6 +46,9 @@ user = root
 user = root
 
 [/opt/util-tests/tests/dladm/show-overlay-exit]
+user = root
+
+[/opt/util-tests/tests/flowadm/create-flow]
 user = root
 
 [/opt/util-tests/tests/libsff/libsff]

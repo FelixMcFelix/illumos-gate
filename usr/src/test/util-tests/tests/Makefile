@@ -17,6 +17,7 @@
 # Copyright 2020 Joyent, Inc.
 # Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
 # Copyright 2025 Edgecast Cloud LLC
+# Copyright 2026 Oxide Computer Company
 #
 
 SUBDIRS =		\
@@ -32,6 +33,7 @@ SUBDIRS =		\
 	dladm		\
 	du		\
 	find		\
+	flowadm		\
 	grep_xpg4	\
 	head		\
 	iconv		\
